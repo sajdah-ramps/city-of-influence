@@ -54,7 +54,11 @@ export const CAFE_HOTSPOTS = {
   },
 };
 
+// Prepend Vite's base URL so the models resolve both at the dev root ('/')
+// and under the GitHub Pages subpath ('/city-of-influence/'). BASE_URL always
+// ends in a slash.
+const BASE = import.meta.env.BASE_URL;
 export const MODELS = {
-  city: '/models/city_scene.glb', // swap city_scene_dev.glb in during development
-  cafe: '/models/cafe_interior.glb',
+  city: `${BASE}models/city_scene.glb`, // swap city_scene_dev.glb in during development
+  cafe: `${BASE}models/cafe_interior.glb`,
 };

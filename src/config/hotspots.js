@@ -59,6 +59,6 @@ export const CAFE_HOTSPOTS = {
 // ends in a slash.
 const BASE = import.meta.env.BASE_URL;
 export const MODELS = {
-  city: `${BASE}models/city_scene.glb`, // swap city_scene_dev.glb in during development
+  city: `${BASE}models/city_scene.glb?v=2`, // bump ?v= when the model file changes to bust caches; swap city_scene_dev.glb in during development
   cafe: `${BASE}models/cafe_interior.glb`,
 };

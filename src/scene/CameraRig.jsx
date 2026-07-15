@@ -28,8 +28,31 @@ const CAFE = {
   target: new THREE.Vector3(-3, 1.4, -5), // looking into the room
 };
 
-// Walkable rectangle for free roam. TODO: tune against the scene geometry.
-export const WALK_BOUNDS = { minX: -20, maxX: 20, minZ: -20, maxZ: 20 };
+// Walkable rectangle for free roam — kept inside the street canyon so the
+// core buildings always frame the view rather than the open horizon. The
+// road/sidewalk span X -30..40, Z -44..16; these stay a bit inside that.
+export const WALK_BOUNDS = { minX: -22, maxX: 34, minZ: -38, maxZ: 18 };
+
+// Zoom via scroll wheel adjusts the camera FOV (narrow = zoomed in).
+const ZOOM_MIN = 32; // most zoomed-in FOV
+const ZOOM_MAX = 70; // most zoomed-out FOV
+const ZOOM_DEFAULT = 45;
+
+// Collision: the player is treated as a circle of this radius, kept out of the
+// XZ footprint of solid meshes (buildings + the big street structures).
+const PLAYER_RADIUS = 0.6;
+function isCollider(name) {
+  return (
+    name.startsWith('bldg_') ||
+    name.endsWith('_body') || // newsstand_body, payphone_body
+    name.startsWith('shelter_') ||
+    name === 'billboard_frame' ||
+    name === 'plaque_frame' ||
+    name.startsWith('Counter') ||
+    name.startsWith('Wall_') ||
+    name.startsWith('taxi_')
+  );
+}
 
 const WALK_DURATION = 1.5; // seconds
 const ENTER_DURATION = 2.4;
@@ -39,17 +62,16 @@ const EYE = 1.6;
 const ROAM_SPEED = 2.2; // m/s
 const ROAM_SPRINT = 4.2;
 const ACCEL = 8; // 1/s — velocity lerp rate
-const GROUND_SMOOTH = 10; // 1/s — eye-height lerp rate
 const LOOK_SENSITIVITY = 0.0035; // rad/px
-const PITCH_LIMIT = Math.PI / 3; // ±60°
+const PITCH_LIMIT = Math.PI / 6; // ±30° — enough to glance up/down, not under the map
 const DRAG_THRESHOLD = 5; // px of pointer travel — below this a gesture is a click
 // Cursor steering: the cursor's offset from the canvas center turns the view.
-// A center dead-zone keeps the view calm when looking straight ahead; the
-// turn ramps up toward the edges. No drag, no dwell.
-const STEER_DEADZONE = 0.22; // fraction of half-canvas that stays still
-const STEER_YAW_SPEED = 1.6; // rad/s at the canvas edge
-const STEER_PITCH_SPEED = 1.0;
-const GROUND_KEYWORDS = ['ground', 'floor', 'patiodeck', 'road', 'sidewalk'];
+// A large center dead-zone keeps most of the screen calm; the turn only ramps
+// up (gently) near the edges, so it feels anchored rather than loose.
+const STEER_DEADZONE = 0.34; // fraction of half-canvas that stays still
+const STEER_YAW_SPEED = 0.95; // rad/s at the canvas edge
+const STEER_PITCH_SPEED = 0.5;
+const LOOK_DAMP = 18; // 1/s — higher = the view settles/stops promptly (less floaty)
 
 const KEYMAP = {
   KeyW: 'forward',
@@ -65,12 +87,10 @@ const KEYMAP = {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
-const DOWN = new THREE.Vector3(0, -1, 0);
 const _forward = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _input = new THREE.Vector3();
 const _targetVel = new THREE.Vector3();
-const _origin = new THREE.Vector3();
 const _bob = new THREE.Vector3();
 const _euler = new THREE.Euler();
 
@@ -82,6 +102,7 @@ export default function CameraRig({
   onLeft,
   onRoamStart,
   setFade,
+  zoomApiRef,
 }) {
   const { camera, scene, gl } = useThree();
   const t = useRef(0); // idle time accumulator
@@ -105,16 +126,12 @@ export default function CameraRig({
   const eyeY = useRef(EYE); // smoothed eye height (pre-bob)
   const bobClock = useRef(0); // advances with distance traveled
   const prevBob = useRef(new THREE.Vector3());
-  const groundMeshes = useRef([]);
-  const raycaster = useRef(new THREE.Raycaster());
   const drag = useRef({ down: false, x: 0, y: 0, total: 0 });
   const suppressClick = useRef(false);
   const pointerPx = useRef({ x: -1, y: -1 }); // raw client coords for cursor steering
   const canvasRect = useRef(null); // cached — reading layout every frame causes jank
-  const groundAccum = useRef(1); // time since last ground raycast
-  const groundTargetY = useRef(EYE);
-  const lastCastX = useRef(0);
-  const lastCastZ = useRef(0);
+  const fovTarget = useRef(ZOOM_DEFAULT); // scroll-wheel zoom target
+  const colliders = useRef(null); // XZ boxes of solid meshes, built lazily
   const reducedMotion = useRef(
     window.matchMedia('(prefers-reduced-motion: reduce)').matches
   );
@@ -176,19 +193,27 @@ export default function CameraRig({
     pitch.current = THREE.MathUtils.clamp(_euler.x, -PITCH_LIMIT, PITCH_LIMIT);
     yawTarget.current = yaw.current;
     pitchTarget.current = pitch.current;
+    // hold whatever eye height we started at — glide flat, no ground-follow
     eyeY.current = camera.position.y;
-    groundTargetY.current = camera.position.y;
-    groundAccum.current = 1; // force a fresh ground cast on the first roam frame
     velocity.current.set(0, 0, 0);
     prevBob.current.set(0, 0, 0);
-    // cache walkable geometry so the per-frame ground ray stays cheap
-    const found = [];
-    scene.traverse((o) => {
-      if (!o.isMesh) return;
-      const n = `${o.name}/${o.parent?.name ?? ''}`.toLowerCase();
-      if (GROUND_KEYWORDS.some((k) => n.includes(k))) found.push(o);
-    });
-    groundMeshes.current = found;
+    // Build the collision boxes once (world-space, so stable across reloads).
+    if (!colliders.current) {
+      scene.updateMatrixWorld(true);
+      const box = new THREE.Box3();
+      const list = [];
+      scene.traverse((o) => {
+        if (!o.isMesh || !isCollider(o.name)) return;
+        box.setFromObject(o);
+        list.push({
+          minX: box.min.x - PLAYER_RADIUS,
+          maxX: box.max.x + PLAYER_RADIUS,
+          minZ: box.min.z - PLAYER_RADIUS,
+          maxZ: box.max.z + PLAYER_RADIUS,
+        });
+      });
+      colliders.current = list;
+    }
     onRoamStartRef.current?.();
   };
 
@@ -282,6 +307,38 @@ export default function CameraRig({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gl]);
 
+  // Scroll wheel zooms the camera (FOV); the actual easing happens in useFrame.
+  useEffect(() => {
+    const el = gl.domElement;
+    const onWheel = (e) => {
+      e.preventDefault();
+      fovTarget.current = THREE.MathUtils.clamp(
+        fovTarget.current + e.deltaY * 0.03,
+        ZOOM_MIN,
+        ZOOM_MAX
+      );
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [gl]);
+
+  // Expose zoom to the UI buttons (delta<0 = zoom in). Also +/- keys.
+  useEffect(() => {
+    const zoom = (delta) => {
+      fovTarget.current = THREE.MathUtils.clamp(fovTarget.current + delta, ZOOM_MIN, ZOOM_MAX);
+    };
+    if (zoomApiRef) zoomApiRef.current = zoom;
+    const onKey = (e) => {
+      if (e.key === '+' || e.key === '=') zoom(-6);
+      else if (e.key === '-' || e.key === '_') zoom(6);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      if (zoomApiRef) zoomApiRef.current = null;
+    };
+  }, [zoomApiRef]);
+
   // Focus changes: walk up to the hotspot, or back to the street anchor.
   useEffect(() => {
     if (mode !== 'city') {
@@ -340,6 +397,12 @@ export default function CameraRig({
     const dt = Math.min(delta, 0.05);
     const j = journey.current;
     const bobAllowed = !motionPaused && !reducedMotion.current;
+
+    // smooth scroll-wheel zoom (works in every camera mode)
+    if (Math.abs(camera.fov - fovTarget.current) > 0.01) {
+      camera.fov += (fovTarget.current - camera.fov) * (1 - Math.exp(-9 * dt));
+      camera.updateProjectionMatrix();
+    }
 
     if (j) {
       j.t = Math.min(j.t + dt / j.duration, 1);
@@ -409,8 +472,8 @@ export default function CameraRig({
     if (roaming.current && mode === 'city') {
       camera.position.sub(prevBob.current);
 
-      // ease the look toward the input target so drag/edge turns feel fluid
-      const lookDamp = 1 - Math.exp(-14 * dt);
+      // ease the look toward the input target so drag/cursor turns feel fluid
+      const lookDamp = 1 - Math.exp(-LOOK_DAMP * dt);
       yaw.current += (yawTarget.current - yaw.current) * lookDamp;
       pitch.current += (pitchTarget.current - pitch.current) * lookDamp;
 
@@ -436,38 +499,35 @@ export default function CameraRig({
           .multiplyScalar(k.has('shift') ? ROAM_SPRINT : ROAM_SPEED);
       }
       velocity.current.lerp(_targetVel, 1 - Math.exp(-ACCEL * dt));
-      camera.position.addScaledVector(velocity.current, dt);
 
-      camera.position.x = THREE.MathUtils.clamp(
-        camera.position.x,
-        WALK_BOUNDS.minX,
-        WALK_BOUNDS.maxX
-      );
-      camera.position.z = THREE.MathUtils.clamp(
-        camera.position.z,
-        WALK_BOUNDS.minZ,
-        WALK_BOUNDS.maxZ
-      );
-
-      // follow the ground: ray straight down, throttled (raycasting every
-      // frame — especially the whole-scene fallback — causes visible hitches)
-      groundAccum.current += dt;
-      const movedX = camera.position.x - lastCastX.current;
-      const movedZ = camera.position.z - lastCastZ.current;
-      if (groundAccum.current > 0.09 || movedX * movedX + movedZ * movedZ > 0.09) {
-        groundAccum.current = 0;
-        lastCastX.current = camera.position.x;
-        lastCastZ.current = camera.position.z;
-        _origin.set(camera.position.x, eyeY.current + 2, camera.position.z);
-        raycaster.current.set(_origin, DOWN);
-        raycaster.current.far = 10;
-        const targets = groundMeshes.current.length ? groundMeshes.current : scene.children;
-        const hits = raycaster.current.intersectObjects(targets, true);
-        if (hits.length) groundTargetY.current = hits[0].point.y + EYE;
+      // Resolve collision per-axis (so you slide along walls) against the
+      // solid meshes' XZ boxes, then clamp to the outer walkable rectangle.
+      let px = camera.position.x + velocity.current.x * dt;
+      let pz = camera.position.z + velocity.current.z * dt;
+      const cols = colliders.current;
+      if (cols) {
+        const z0 = camera.position.z;
+        for (const c of cols) {
+          if (px > c.minX && px < c.maxX && z0 > c.minZ && z0 < c.maxZ) {
+            px = velocity.current.x > 0 ? c.minX : c.maxX;
+            velocity.current.x = 0;
+          }
+        }
+        for (const c of cols) {
+          if (px > c.minX && px < c.maxX && pz > c.minZ && pz < c.maxZ) {
+            pz = velocity.current.z > 0 ? c.minZ : c.maxZ;
+            velocity.current.z = 0;
+          }
+        }
       }
-      // eye height eases toward the last hit every frame, so curbs stay soft
-      eyeY.current +=
-        (groundTargetY.current - eyeY.current) * (1 - Math.exp(-GROUND_SMOOTH * dt));
+      camera.position.x = THREE.MathUtils.clamp(px, WALK_BOUNDS.minX, WALK_BOUNDS.maxX);
+      camera.position.z = THREE.MathUtils.clamp(pz, WALK_BOUNDS.minZ, WALK_BOUNDS.maxZ);
+
+      // Hold a stable eye height (seeded from the anchor at beginRoam). We
+      // deliberately do NOT ground-raycast per frame: the street's ground
+      // sits well below y=0, so following it let the camera dip under the map
+      // and stare at the blown-out underside. A constant glide height is
+      // predictable and can't clip below the street.
       camera.position.y = eyeY.current;
 
       // head-bob, advanced by distance traveled

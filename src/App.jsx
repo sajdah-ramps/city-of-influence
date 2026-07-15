@@ -14,6 +14,7 @@ import TwilightSky from './scene/TwilightSky.jsx';
 import FocusAffordance from './scene/FocusAffordance.jsx';
 import Shell from './ui/Shell.jsx';
 import SectionPanel from './ui/SectionPanel.jsx';
+import Landing from './ui/Landing.jsx';
 import { HOTSPOTS, CAFE_HOTSPOTS } from './config/hotspots.js';
 
 export default function App() {
@@ -27,7 +28,9 @@ export default function App() {
   );
   const [fade, setFade] = useState(0); // 0 transparent, 1 black
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [entered, setEntered] = useState(false);
   const appRef = useRef(null);
+  const zoomApiRef = useRef(null);
 
   const inCafe = mode === 'cafe' || mode === 'leaving';
   const hotspotMap = inCafe ? CAFE_HOTSPOTS : HOTSPOTS;
@@ -159,6 +162,7 @@ export default function App() {
               onLeft={handleLeft}
               onRoamStart={backToStreet}
               setFade={setFade}
+              zoomApiRef={zoomApiRef}
             />
           </Suspense>
           {/* Low cool ambient — a floor that keeps blacks rich, not milky */}
@@ -186,6 +190,23 @@ export default function App() {
 
         {/* fade overlay for the cafe transition */}
         <div className="fade-overlay" style={{ opacity: fade }} aria-hidden="true" />
+
+        <div className="zoom-controls">
+          <button
+            className="zoom-btn"
+            onClick={() => zoomApiRef.current?.(-8)}
+            aria-label="Zoom in"
+          >
+            +
+          </button>
+          <button
+            className="zoom-btn"
+            onClick={() => zoomApiRef.current?.(8)}
+            aria-label="Zoom out"
+          >
+            −
+          </button>
+        </div>
       </div>
 
       {panelOpen && focusedHotspot && (
@@ -200,6 +221,8 @@ export default function App() {
       <footer className="site-footer">
         City of Influence is an Interactive Portfolio created by Rae-Anne Richardson
       </footer>
+
+      <Landing onEnter={() => setEntered(true)} hidden={entered} />
     </div>
   );
 }
